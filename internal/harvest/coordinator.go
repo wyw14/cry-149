@@ -36,8 +36,11 @@ func (c *Coordinator) Transfer(ctx context.Context, batchID, vesselID string, ro
 		Route: route.Clone(), State: "waiting", UpdatedAt: c.now(),
 	}
 	c.state.Set(transfer)
-	c.router.mu.Lock()
-	defer c.router.mu.Unlock()
+	// The shared route mutex only guards the routes snapshot map. It must not be
+	// held across the backoff wait: an unrelated transfer on a non-overlapping
+	// pipeline would otherwise block until this transfer's downstream is back,
+	// and releasing the claim while still locked would self-deadlock. Segment
+	// conflict detection lives in RouteClaims.Reserve under its own lock.
 	for attempt := 0; attempt < 3; attempt++ {
 		if available(attempt) {
 			segments := make([]string, 0, len(route.Segments))
@@ -47,7 +50,9 @@ func (c *Coordinator) Transfer(ctx context.Context, batchID, vesselID string, ro
 			if err := c.router.claims.Reserve(utility.RouteClaim{RouteID: transfer.ID, Owner: transfer.ID, Segments: segments, CreatedAt: c.now()}); err != nil {
 				continue
 			}
+			c.router.mu.Lock()
 			c.router.routes[transfer.ID] = route.Clone()
+			c.router.mu.Unlock()
 			transfer.State = "active"
 			transfer.UpdatedAt = c.now()
 			c.state.Set(transfer)
