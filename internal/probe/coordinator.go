@@ -58,22 +58,50 @@ func (r *Registry) Subscribe(id string, buffer int) (<-chan Calibration, func(),
 }
 
 func (r *Registry) Broadcast(calibration Calibration) int {
+	// Snapshot the listeners under the lock, then release it before any
+	// channel send. A blocking send held while the registry lock is held is the
+	// classic head-of-line stall: one listener whose stream is full (its batch
+	// consumer has exited or stalled) wedges the entire registry, hanging every
+	// reader of r.mu (Get, ListenerCount, Subscribe, even the listener's own
+	// cancel). By sending only after releasing the lock, no single listener can
+	// block the rest or the registry.
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.calibrations[calibration.ProbeID] = calibration
+	pending := make([]listener, 0, len(r.listeners))
 	for id, item := range r.listeners {
 		select {
 		case <-item.done:
+			// Listener signaled done; prune it so a stale entry never survives.
 			delete(r.listeners, id)
 		default:
+			pending = append(pending, item)
 		}
 	}
+	r.mu.Unlock()
+
 	delivered := 0
-	for _, item := range r.listeners {
-		item.stream <- calibration
-		delivered++
+	for _, item := range pending {
+		// Non-blocking send: a listener whose stream is full (consumer gone or
+		// slow) cannot stall the broadcast. Drop this delivery and evict the
+		// listener so it stops absorbing future broadcasts and clogging Get/
+		// ListenerCount — the "abandoned listener blocks global broadcast" path.
+		select {
+		case item.stream <- calibration:
+			delivered++
+		default:
+			r.evict(item.id)
+		}
 	}
 	return delivered
+}
+
+// evict removes a listener that can no longer keep up with broadcasts. It is
+// safe to call concurrently with Broadcast/Subscribe since it re-acquires the
+// lock, and it tolerates the listener already being gone.
+func (r *Registry) evict(id string) {
+	r.mu.Lock()
+	delete(r.listeners, id)
+	r.mu.Unlock()
 }
 
 func (r *Registry) Get(probeID string) (Calibration, bool) {

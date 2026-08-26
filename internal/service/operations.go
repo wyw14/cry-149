@@ -117,9 +117,13 @@ func (r *Runtime) attachCalibrationWorker(batchID string) error {
 	}
 	stream, cancel, err := r.probeRegistry.Subscribe("batch:"+batchID, 8)
 	if err != nil {
+		// No listener to cancel yet, but the worker group was attached. Roll it
+		// back so a failed subscribe does not leave a dangling, listener-less
+		// worker group that nothing else will stop.
+		r.batchWorkers.Stop(batchID)
 		return err
 	}
-	return group.Start(func(ctx context.Context) {
+	if err := group.Start(func(ctx context.Context) {
 		defer cancel()
 		for {
 			select {
@@ -131,7 +135,14 @@ func (r *Runtime) attachCalibrationWorker(batchID string) error {
 				})
 			}
 		}
-	}, nil)
+	}, nil); err != nil {
+		// Start rejected the worker (group already stopping/closed). Cancel the
+		// subscription so it does not linger as an abandoned listener whose
+		// buffered stream fills up and eventually stalls global broadcasts.
+		cancel()
+		return err
+	}
+	return nil
 }
 
 func (r *Runtime) CalibrateProbe(calibration probe.Calibration) int {
