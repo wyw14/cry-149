@@ -64,9 +64,31 @@ func (s *Scheduler) run(ctx context.Context, item *worker) {
 		case <-ctx.Done():
 			return
 		case pulse := <-item.queue:
+			// Re-validate at delivery: a pulse may have expired while waiting
+			// behind a slow vessel. Dropping it here prevents a burst of stale
+			// pulses from being flushed onto the link when it recovers.
+			if s.stale(pulse, item.lifecycle) {
+				s.reject(pulse.VesselID)
+				continue
+			}
 			_ = item.sink.Apply(ctx, pulse)
 		}
 	}
+}
+
+// stale reports whether pulse must no longer be delivered because its batch is
+// no longer active or its expiry has elapsed. It is checked at both enqueue
+// and delivery so that validity is enforced at the moment of application.
+func (s *Scheduler) stale(pulse Pulse, lifecycle Lifecycle) bool {
+	return !lifecycle.Active(pulse.BatchID) || !pulse.ExpiresAt.After(s.now())
+}
+
+// reject records that a pulse for vesselID was dropped due to congestion
+// (backpressure or post-queue expiry) so slow vessels stay observable.
+func (s *Scheduler) reject(vesselID string) {
+	s.mu.Lock()
+	s.rejected[vesselID]++
+	s.mu.Unlock()
 }
 
 func (s *Scheduler) Schedule(pulse Pulse) error {
@@ -83,12 +105,19 @@ func (s *Scheduler) Schedule(pulse Pulse) error {
 	if !item.lifecycle.Active(pulse.BatchID) || !pulse.ExpiresAt.After(s.now()) {
 		return errors.New("feed pulse is no longer valid for the active batch")
 	}
+	// Backpressure: when the per-vessel queue is full the sink is not keeping
+	// up (a slow/stalled vessel). Rather than spawning an unbounded backlog of
+	// blocked goroutines — which would let memory climb while the link is slow
+	// and then flush every stale pulse at once when it recovers — we reject the
+	// pulse so the caller surfaces backpressure immediately. The worker also
+	// re-validates expiry at delivery, so anything that aged out while queued
+	// is dropped instead of being applied.
 	select {
 	case item.queue <- pulse:
 		return nil
 	default:
-		go func() { item.queue <- pulse }()
-		return nil
+		s.reject(pulse.VesselID)
+		return fmt.Errorf("%w: vessel %s", ErrBackpressure, pulse.VesselID)
 	}
 }
 
