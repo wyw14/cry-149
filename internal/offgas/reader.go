@@ -49,7 +49,12 @@ func (r *Reader) Next() (Record, error) {
 		}
 		if err != nil {
 			if err == io.EOF {
-				return Record{}, io.EOF
+				// Input is exhausted, but the final Read may have returned
+				// bytes together with io.EOF (valid io.Reader behavior). Loop
+				// back so the newline scan and the done-flush below emit the
+				// trailing record instead of discarding it as a bare EOF.
+				r.done = true
+				continue
 			}
 			return Record{}, fmt.Errorf("read offgas input: %w", err)
 		}
