@@ -1,0 +1,10 @@
+.git
+.claude
+.verification-cache
+evidence
+runner
+staging
+workspaces
+var
+*.jsonl
+*.log
